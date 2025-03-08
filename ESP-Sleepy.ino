@@ -1,6 +1,6 @@
 
 /**
- * ESP-Sleepy: Ultra-Efficient Deep-Sleep Optimizer for ESP32 with LoRaWAN & Sensors
+ * ESP-Sleepy: Ultra-Efficient Deep-Sleep Optimizer for ESP32 with LoRaWAN
  *
  * - Adaptive Sleep: Learns when to wake up based on sensor changes
  * - Event-Based LoRa Transmission: Only sends data when necessary
@@ -8,14 +8,12 @@
  * - Optional Battery Monitoring: Saves power when disabled
  * - Auto-Recovery & System Check: Prevents boot loops
  * - Fully integrated LoRaWAN support (TTGO LoRa ESP32)
- * - Additional Sensors: Temperature, CO₂, Motion Detection
  *
  * Installation:
  * 1. Install Arduino IDE with ESP32 board support
- * 2. Install LoRa library: "Arduino-LoRa"
- * 3. Install Adafruit BME280, SCD30, and MPU6050 libraries if using these sensors
- * 4. Flash this script onto an ESP32 LoRa board
- * 5. Open the serial console (115200 baud) and use the following commands:
+ * 2. Install LoRa library: "Arduino-LoRa" (for LoRaWAN)
+ * 3. Flash this script onto an ESP32 LoRa board
+ * 4. Open the serial console (115200 baud) and use the following commands:
  *    - 'sleep 600' -> Sets sleep time to 600 seconds
  *    - 'chaos on' -> Activates random wake-ups
  *    - 'battery off' -> Disables battery monitoring
@@ -28,50 +26,33 @@
 #include <Arduino.h>
 #include <esp_sleep.h>
 #include <Preferences.h>
-#include <Wire.h>
 #include <SPI.h>
 #include <LoRa.h>
-#include <Adafruit_BME280.h>  // Temp & Humidity
-#include <Adafruit_SCD30.h>   // CO₂
-#include <Adafruit_MPU6050.h> // Motion Sensor
 
 #define DEFAULT_SLEEP_TIME 300  
-#define BATTERY_PIN 34  
-#define LORA_FREQUENCY 868E6  
-
-// Sensor Thresholds for LoRa Transmission
-#define TEMP_CHANGE_THRESHOLD 2.0
-#define CO2_CHANGE_THRESHOLD 50
-#define MOTION_THRESHOLD 2.0  // Acceleration Change
+#define BATTERY_PIN 34  // ADC Pin for battery voltage measurement
+#define LORA_TRIGGER_THRESHOLD 5  // % change required to trigger LoRa transmission
+#define LORA_FREQUENCY 868E6  // Set frequency for EU (868 MHz)
 
 Preferences preferences;
 bool batteryMonitoring = true;
 bool wakeUpTaskEnabled = true;
 int lastBatteryLevel = -1;
-float lastTemp = -1000;
-int lastCO2 = -1;
-float lastAccel = 0;
-
-Adafruit_BME280 bme;
-Adafruit_SCD30 scd30;
-Adafruit_MPU6050 mpu;
 
 void enterDeepSleep(int sleepTime);
 void handleSerialInput();
 int getBatteryLevel();
 int getRandomSleepTime();
 void performWakeUpTask();
-void sendLoRaData(String data);
+void sendLoRaData(int batteryLevel);
 void setupLoRa();
-void setupSensors();
-bool detectSignificantChange(float temp, int co2, float accel);
 
 void setup() {
     Serial.begin(115200);
     setupLoRa();
-    setupSensors();
 
     preferences.begin("esp-sleepy", false);
+
     int sleepTime = preferences.getInt("sleepTime", DEFAULT_SLEEP_TIME);
 
     if (batteryMonitoring) {
@@ -80,9 +61,21 @@ void setup() {
             sleepTime = 600;
             Serial.println("Low battery. Extending sleep time.");
         }
+        if (lastBatteryLevel != -1 && abs(batteryLevel - lastBatteryLevel) > LORA_TRIGGER_THRESHOLD) {
+            sendLoRaData(batteryLevel);
+        }
+        lastBatteryLevel = batteryLevel;
     }
 
-    performWakeUpTask();
+    if (preferences.getBool("chaos", false)) {
+        sleepTime = getRandomSleepTime();
+        Serial.printf("Chaotic Mode active. Sleep time: %d sec.\n", sleepTime);
+    }
+
+    if (wakeUpTaskEnabled) {
+        performWakeUpTask();
+    }
+
     enterDeepSleep(sleepTime);
 }
 
@@ -95,6 +88,7 @@ void enterDeepSleep(int sleepTime) {
     preferences.putInt("sleepTime", sleepTime);
     preferences.putBool("batteryMonitoring", batteryMonitoring);
     preferences.putBool("wakeUpTask", wakeUpTaskEnabled);
+    preferences.putInt("lastBattery", lastBatteryLevel);
     preferences.end();
 
     esp_sleep_enable_timer_wakeup(sleepTime * 1000000LL);
@@ -156,67 +150,38 @@ void performWakeUpTask() {
     if (!wakeUpTaskEnabled) return;
 
     Serial.println("Performing wake-up task...");
-    float temperature = bme.readTemperature();
-    int co2 = scd30.getCO2();
-    sensors_event_t accel;
-    mpu.getAccelerometerSensor()->getEvent(&accel);
-    float acceleration = sqrt(accel.acceleration.x * accel.acceleration.x +
-                              accel.acceleration.y * accel.acceleration.y +
-                              accel.acceleration.z * accel.acceleration.z);
-
-    if (detectSignificantChange(temperature, co2, acceleration)) {
-        String data = "T:" + String(temperature, 1) + "C, CO2:" + String(co2) + "ppm, Accel:" + String(acceleration, 2) + "m/s²";
-        sendLoRaData(data);
+    int batteryLevel = getBatteryLevel();
+    if (batteryLevel < 15) {
+        Serial.println("Warning: Battery critically low!");
     }
 
-    lastTemp = temperature;
-    lastCO2 = co2;
-    lastAccel = acceleration;
+    // Future: Additional sensor readings, advanced diagnostics
 }
 
-void sendLoRaData(String data) {
-    Serial.println("Sending LoRa Data: " + data);
+void sendLoRaData(int batteryLevel) {
+    Serial.printf("LoRa Transmission Triggered. Battery: %d%%\n", batteryLevel);
+    
     LoRa.beginPacket();
-    LoRa.print(data);
-    LoRa.endPacket();
+    LoRa.print("Battery: ");
+    LoRa.print(batteryLevel);
+    LoRa.println("%");
+    int status = LoRa.endPacket();
+    
+    if (status == 1) {
+        Serial.println("LoRa transmission successful.");
+    } else {
+        Serial.println("LoRa transmission failed.");
+    }
 }
 
 void setupLoRa() {
     Serial.println("Initializing LoRa...");
-    SPI.begin(5, 19, 27, 18);
-    LoRa.setPins(18, 23, 26);
+    SPI.begin(5, 19, 27, 18);  // SPI pins for TTGO LoRa
+    LoRa.setPins(18, 23, 26);  // NSS, Reset, DIO0
     if (!LoRa.begin(LORA_FREQUENCY)) {
         Serial.println("LoRa initialization failed.");
         while (1);
     }
     LoRa.setSyncWord(0x34);
     Serial.println("LoRa initialized.");
-}
-
-void setupSensors() {
-    Serial.println("Initializing Sensors...");
-
-    if (!bme.begin(0x76)) {
-        Serial.println("BME280 not found.");
-    } else {
-        Serial.println("BME280 initialized.");
-    }
-
-    if (!scd30.begin()) {
-        Serial.println("SCD30 not found.");
-    } else {
-        Serial.println("SCD30 initialized.");
-    }
-
-    if (!mpu.begin()) {
-        Serial.println("MPU6050 not found.");
-    } else {
-        Serial.println("MPU6050 initialized.");
-    }
-}
-
-bool detectSignificantChange(float temp, int co2, float accel) {
-    return (abs(temp - lastTemp) > TEMP_CHANGE_THRESHOLD) ||
-           (abs(co2 - lastCO2) > CO2_CHANGE_THRESHOLD) ||
-           (abs(accel - lastAccel) > MOTION_THRESHOLD);
 }
